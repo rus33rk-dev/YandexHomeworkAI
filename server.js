@@ -1,3 +1,4 @@
+
 require("dotenv").config();
 
 const express = require("express");
@@ -6,17 +7,20 @@ const OpenAI = require("openai");
 const app = express();
 const PORT = process.env.PORT || 3210;
 
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET;
+
 if (!process.env.OPENAI_API_KEY) {
-  console.error("Не найден OPENAI_API_KEY в переменных окружения");
+  console.error("Не найден OPENAI_API_KEY");
   process.exit(1);
 }
 
-if (!process.env.TELEGRAM_BOT_TOKEN) {
+if (!BOT_TOKEN) {
   console.error("Не найден TELEGRAM_BOT_TOKEN");
   process.exit(1);
 }
 
-if (!process.env.TELEGRAM_WEBHOOK_SECRET) {
+if (!WEBHOOK_SECRET) {
   console.error("Не найден TELEGRAM_WEBHOOK_SECRET");
   process.exit(1);
 }
@@ -24,9 +28,6 @@ if (!process.env.TELEGRAM_WEBHOOK_SECRET) {
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
-
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET;
 
 app.use(express.json({ limit: "100kb" }));
 
@@ -53,61 +54,80 @@ async function sendTelegramMessage(chatId, message) {
     `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json"
+      },
       body: JSON.stringify({
         chat_id: chatId,
         text: message
-      })
+      }),
+      signal: AbortSignal.timeout(15000)
     }
   );
 
-  if (!response.ok) {
-    throw new Error("Не удалось отправить сообщение в Telegram");
+  const result = await response.json();
+
+  if (!response.ok || !result.ok) {
+    throw new Error(
+      result.description || `Telegram HTTP ${response.status}`
+    );
   }
+
+  console.log("Telegram message sent successfully");
 }
 
-// Telegram Webhook
-app.post("/telegram/webhook", async (req, res) => {
-  if (
-    req.get("X-Telegram-Bot-Api-Secret-Token") !== WEBHOOK_SECRET
-  ) {
-    return res.sendStatus(403);
-  }
-
-  const message = req.body.message;
+// Обработка команд Telegram
+async function processTelegramMessage(message) {
   const chatId = message?.chat?.id;
   const text = message?.text?.trim();
 
-  if (!chatId || !text) {
-    return res.sendStatus(200);
+  if (!chatId || !text) return;
+
+  if (text === "/start") {
+    await sendTelegramMessage(
+      chatId,
+      "Привет! Я бот Yandex Homework AI.\n\n/wake — проверить и разбудить сервер."
+    );
+    return;
   }
 
-  try {
-    if (text === "/start") {
-      await sendTelegramMessage(
-        chatId,
-        "Привет! Я бот для управления Yandex Homework AI.\n\nНапиши /wake, чтобы разбудить сервер Render."
-      );
-    } else if (text === "/wake") {
-      await sendTelegramMessage(
-        chatId,
-        "Сервер запущен и отвечает! Можно пользоваться Yandex Homework AI."
-      );
-    } else {
-      await sendTelegramMessage(
-        chatId,
-        "Напиши /wake, чтобы проверить и разбудить сервер."
-      );
-    }
+  if (text === "/wake") {
+    await sendTelegramMessage(
+      chatId,
+      "Сервер Yandex Homework AI работает! Можно пользоваться приложением."
+    );
+    return;
+  }
 
-    res.sendStatus(200);
-  } catch (error) {
-    console.error("Telegram error:", error.message);
-    res.sendStatus(500);
+  await sendTelegramMessage(
+    chatId,
+    "Неизвестная команда.\nИспользуй /wake для проверки сервера."
+  );
+}
+
+// Webhook Telegram
+app.post("/telegram/webhook", (req, res) => {
+  const secret = req.get("X-Telegram-Bot-Api-Secret-Token");
+
+  if (secret !== WEBHOOK_SECRET) {
+    console.log("Telegram webhook: неверный секрет");
+    return res.sendStatus(403);
+  }
+
+  const update = req.body;
+
+  // Сразу подтверждаем получение сообщения Telegram
+  res.sendStatus(200);
+
+  // Обрабатываем сообщение отдельно
+  if (update?.message) {
+    processTelegramMessage(update.message).catch(error => {
+      console.error("Ошибка обработки Telegram:", error.message);
+    });
   }
 });
 
-// Решение заданий
+// Решение школьных заданий
 app.post("/solve", async (req, res) => {
   try {
     const { task } = req.body;
@@ -158,6 +178,7 @@ app.post("/solve", async (req, res) => {
   }
 });
 
+// Запуск сервера
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Yandex Homework AI запущен на порту ${PORT}`);
 });
