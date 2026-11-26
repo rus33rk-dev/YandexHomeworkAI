@@ -4,15 +4,14 @@ require("dotenv").config();
 const express = require("express");
 const OpenAI = require("openai");
 const { Pool } = require("pg");
+const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 3210;
-
 const MODEL = process.env.OPENAI_MODEL || "gpt-6.2-astra";
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET;
-
 const TELEGRAM_WEBHOOK_PATH = "/telegram/webhook";
 
 const PUBLIC_URL =
@@ -24,35 +23,71 @@ if (!process.env.OPENAI_API_KEY) {
   process.exit(1);
 }
 
+if (!process.env.DATABASE_URL) {
+  console.error("Не найден DATABASE_URL");
+  process.exit(1);
+}
+
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
-// ==========================================
-// POSTGRESQL
-// ==========================================
-
-const pool = process.env.DATABASE_URL
-  ? new Pool({
-      connectionString: process.env.DATABASE_URL,
-      ssl: { rejectUnauthorized: false },
-      max: 5,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 10000
-    })
-  : null;
-
-if (!pool) {
-  console.error("DATABASE_URL не найден");
-  process.exit(1);
-}
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+  max: 5,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000
+});
 
 pool.on("error", error => {
-  console.error("Ошибка PostgreSQL:", error.message);
+  console.error("PostgreSQL:", error.message);
 });
 
 // ==========================================
-// СОЗДАНИЕ БАЗЫ ДАННЫХ
+// ТАРИФЫ
+// ==========================================
+
+const PLANS = {
+  month: {
+    code: "month",
+    title: "1 месяц",
+    description: "Доступ к Yandex Homework AI на 1 месяц",
+    months: 1,
+    rubles: 149,
+    stars: 100
+  },
+
+  three_months: {
+    code: "three_months",
+    title: "3 месяца",
+    description: "Доступ к Yandex Homework AI на 3 месяца",
+    months: 3,
+    rubles: 399,
+    stars: 270
+  },
+
+  six_months: {
+    code: "six_months",
+    title: "6 месяцев",
+    description: "Доступ к Yandex Homework AI на 6 месяцев",
+    months: 6,
+    rubles: 699,
+    stars: 470
+  },
+
+  year: {
+    code: "year",
+    title: "12 месяцев",
+    description: "Доступ к Yandex Homework AI на 12 месяцев",
+    months: 12,
+    rubles: 1099,
+    stars: 740
+  }
+};
+
+// ==========================================
+// БАЗА ДАННЫХ
 // ==========================================
 
 async function initializeDatabase() {
@@ -91,13 +126,16 @@ async function initializeDatabase() {
     );
 
     CREATE INDEX IF NOT EXISTS idx_orders_telegram_id
-    ON orders(telegram_id);
+      ON orders(telegram_id);
 
     CREATE INDEX IF NOT EXISTS idx_licenses_telegram_id
-    ON licenses(telegram_id);
+      ON licenses(telegram_id);
+
+    ALTER TABLE orders
+      ADD COLUMN IF NOT EXISTS telegram_payment_charge_id TEXT;
   `);
 
-  console.log("PostgreSQL: таблицы готовы");
+  console.log("PostgreSQL: база готова");
 }
 
 // ==========================================
@@ -141,7 +179,7 @@ app.get("/db-health", async (req, res) => {
       database: "connected"
     });
   } catch (error) {
-    console.error("DB health:", error.message);
+    console.error(error.message);
 
     res.status(500).json({
       status: "error",
@@ -182,7 +220,7 @@ async function telegramRequest(method, data) {
 }
 
 // ==========================================
-// РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЯ
+// ПОЛЬЗОВАТЕЛИ
 // ==========================================
 
 async function saveTelegramCustomer(user) {
@@ -203,7 +241,7 @@ async function saveTelegramCustomer(user) {
 }
 
 // ==========================================
-// МЕНЮ МАГАЗИНА
+// ГЛАВНОЕ МЕНЮ
 // ==========================================
 
 function shopMenu() {
@@ -242,31 +280,54 @@ async function sendShopMenu(chatId) {
     chat_id: chatId,
     text:
       "🏠 YANDEX HOMEWORK AI\n\n" +
-      "Добро пожаловать в магазин приложения!\n\n" +
+      "Добро пожаловать в магазин!\n\n" +
       "Выбери нужный раздел:",
     reply_markup: shopMenu()
   });
 }
 
 // ==========================================
-// КАТАЛОГ
+// КАТАЛОГ ТАРИФОВ
 // ==========================================
 
 async function showCatalog(chatId) {
+  const text =
+    "🛍 МАГАЗИН YANDEX HOMEWORK AI\n\n" +
+    "Выбери подходящий тариф:\n\n" +
+    "🔹 1 месяц — 149 ₽ / 100 ⭐\n" +
+    "🔹 3 месяца — 399 ₽ / 270 ⭐\n" +
+    "🔹 6 месяцев — 699 ₽ / 470 ⭐\n" +
+    "🔹 12 месяцев — 1099 ₽ / 740 ⭐\n\n" +
+    "Оплата банковской картой будет добавлена отдельно.\n" +
+    "Сейчас доступна оплата Telegram Stars.";
+
   await telegramRequest("sendMessage", {
     chat_id: chatId,
-    text:
-      "🛍 МАГАЗИН YANDEX HOMEWORK AI\n\n" +
-      "Здесь будет доступно приобретение лицензии " +
-      "для мобильного приложения.\n\n" +
-      "Мы готовим тарифы и подключаем безопасную оплату.\n\n" +
-      "Пока можно пользоваться профилем и историей покупок.",
+    text,
     reply_markup: {
       inline_keyboard: [
         [
           {
-            text: "👤 Мой профиль",
-            callback_data: "shop_profile"
+            text: "1 месяц — 100 ⭐",
+            callback_data: "buy_month"
+          }
+        ],
+        [
+          {
+            text: "3 месяца — 270 ⭐",
+            callback_data: "buy_three_months"
+          }
+        ],
+        [
+          {
+            text: "6 месяцев — 470 ⭐",
+            callback_data: "buy_six_months"
+          }
+        ],
+        [
+          {
+            text: "12 месяцев — 740 ⭐",
+            callback_data: "buy_year"
           }
         ],
         [
@@ -281,33 +342,311 @@ async function showCatalog(chatId) {
 }
 
 // ==========================================
+// СОЗДАНИЕ СЧЁТА TELEGRAM STARS
+// ==========================================
+
+async function createStarsInvoice(chatId, user, plan) {
+  const orderResult = await pool.query(
+    `INSERT INTO orders (
+      telegram_id,
+      product_code,
+      amount,
+      currency,
+      payment_provider,
+      payment_status
+    )
+    VALUES ($1, $2, $3, 'XTR', 'telegram_stars', 'pending')
+    RETURNING id`,
+    [
+      String(user.id),
+      plan.code,
+      plan.stars
+    ]
+  );
+
+  const orderId = orderResult.rows[0].id;
+
+  try {
+    await telegramRequest("sendInvoice", {
+      chat_id: chatId,
+      title: `Yandex Homework AI — ${plan.title}`,
+      description: plan.description,
+      payload: `yhai_order_${orderId}`,
+      provider_token: "",
+      currency: "XTR",
+      prices: [
+        {
+          label: plan.title,
+          amount: plan.stars
+        }
+      ]
+    });
+
+    console.log(`Создан счёт Telegram Stars: ${orderId}`);
+  } catch (error) {
+    await pool.query(
+      `UPDATE orders
+       SET payment_status = 'failed'
+       WHERE id = $1 AND payment_status = 'pending'`,
+      [orderId]
+    );
+
+    throw error;
+  }
+}
+
+// ==========================================
+// ПРОВЕРКА ПРЕДВАРИТЕЛЬНОЙ ОПЛАТЫ
+// ==========================================
+
+async function handlePreCheckout(query) {
+  const payloadMatch = /^yhai_order_(\d+)$/.exec(
+    query.invoice_payload || ""
+  );
+
+  if (!payloadMatch) {
+    await telegramRequest("answerPreCheckoutQuery", {
+      pre_checkout_query_id: query.id,
+      ok: false,
+      error_message: "Некорректный номер заказа."
+    });
+
+    return;
+  }
+
+  const orderId = payloadMatch[1];
+
+  const result = await pool.query(
+    `SELECT *
+     FROM orders
+     WHERE id = $1
+       AND telegram_id = $2
+       AND payment_status = 'pending'`,
+    [
+      orderId,
+      String(query.from.id)
+    ]
+  );
+
+  const order = result.rows[0];
+
+  if (
+    !order ||
+    order.currency !== "XTR" ||
+    Number(order.amount) !== Number(query.total_amount) ||
+    query.currency !== "XTR"
+  ) {
+    await telegramRequest("answerPreCheckoutQuery", {
+      pre_checkout_query_id: query.id,
+      ok: false,
+      error_message:
+        "Заказ не найден или его сумма изменилась. Создай новый заказ."
+    });
+
+    return;
+  }
+
+  await telegramRequest("answerPreCheckoutQuery", {
+    pre_checkout_query_id: query.id,
+    ok: true
+  });
+}
+
+// ==========================================
+// ГЕНЕРАЦИЯ ЛИЦЕНЗИИ
+// ==========================================
+
+function generateLicenseKey() {
+  const value = crypto.randomBytes(8).toString("hex").toUpperCase();
+
+  return (
+    "YHAI-" +
+    value.slice(0, 4) +
+    "-" +
+    value.slice(4, 8) +
+    "-" +
+    value.slice(8, 12) +
+    "-" +
+    value.slice(12, 16)
+  );
+}
+
+// ==========================================
+// ПОДТВЕРЖДЕНИЕ УСПЕШНОЙ ОПЛАТЫ
+// ==========================================
+
+async function handleSuccessfulPayment(message) {
+  const payment = message.successful_payment;
+  const user = message.from;
+  const chatId = message.chat.id;
+
+  const match = /^yhai_order_(\d+)$/.exec(
+    payment.invoice_payload || ""
+  );
+
+  if (!match) {
+    throw new Error("Неизвестный платёжный payload");
+  }
+
+  const orderId = match[1];
+
+  const db = await pool.connect();
+
+  let license;
+
+  try {
+    await db.query("BEGIN");
+
+    const orderResult = await db.query(
+      `SELECT *
+       FROM orders
+       WHERE id = $1 AND telegram_id = $2
+       FOR UPDATE`,
+      [
+        orderId,
+        String(user.id)
+      ]
+    );
+
+    const order = orderResult.rows[0];
+
+    if (!order) {
+      throw new Error("Заказ не найден");
+    }
+
+    if (
+      order.currency !== "XTR" ||
+      Number(order.amount) !== Number(payment.total_amount) ||
+      payment.currency !== "XTR"
+    ) {
+      throw new Error("Несовпадение суммы или валюты платежа");
+    }
+
+    if (order.payment_status === "paid") {
+      const existingLicense = await db.query(
+        `SELECT license_key, plan_code, expires_at
+         FROM licenses
+         WHERE order_id = $1`,
+        [orderId]
+      );
+
+      license = existingLicense.rows[0];
+
+      if (!license) {
+        throw new Error("Оплаченный заказ не имеет лицензии");
+      }
+
+      await db.query("COMMIT");
+    } else {
+      if (order.payment_status !== "pending") {
+        throw new Error("Заказ не ожидает оплату");
+      }
+
+      const plan = PLANS[order.product_code];
+
+      if (!plan) {
+        throw new Error("Тариф заказа не найден");
+      }
+
+      await db.query(
+        `UPDATE orders
+         SET payment_status = 'paid',
+             paid_at = NOW(),
+             telegram_payment_charge_id = $2
+         WHERE id = $1`,
+        [
+          orderId,
+          payment.telegram_payment_charge_id
+        ]
+      );
+
+      const licenseKey = generateLicenseKey();
+
+      const licenseResult = await db.query(
+        `INSERT INTO licenses (
+          license_key,
+          telegram_id,
+          order_id,
+          plan_code,
+          starts_at,
+          expires_at,
+          status
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          NOW(),
+          NOW() + make_interval(months => $5),
+          'active'
+        )
+        RETURNING license_key, plan_code, expires_at`,
+        [
+          licenseKey,
+          String(user.id),
+          orderId,
+          plan.code,
+          plan.months
+        ]
+      );
+
+      license = licenseResult.rows[0];
+
+      await db.query("COMMIT");
+
+      console.log(`Оплата подтверждена. Заказ ${orderId}`);
+    }
+  } catch (error) {
+    await db.query("ROLLBACK");
+    throw error;
+  } finally {
+    db.release();
+  }
+
+  const expiration = new Date(license.expires_at)
+    .toLocaleDateString("ru-RU");
+
+  await telegramRequest("sendMessage", {
+    chat_id: chatId,
+    text:
+      "🎉 ОПЛАТА УСПЕШНО ПРОШЛА!\n\n" +
+      "Спасибо за покупку Yandex Homework AI.\n\n" +
+      "🔑 ТВОЯ ЛИЦЕНЗИЯ:\n\n" +
+      `${license.license_key}\n\n` +
+      `📅 Тариф: ${license.plan_code}\n` +
+      `⏳ Действует до: ${expiration}\n\n` +
+      "Сохрани лицензионный ключ. " +
+      "Он понадобится для активации доступа в приложении.",
+    reply_markup: shopMenu()
+  });
+}
+
+// ==========================================
 // ПРОФИЛЬ
 // ==========================================
 
 async function showProfile(chatId, user) {
   const result = await pool.query(
     `SELECT
-      (SELECT COUNT(*)
-       FROM orders
+      (SELECT COUNT(*) FROM orders
        WHERE telegram_id = $1) AS orders_count,
 
-      (SELECT COUNT(*)
-       FROM licenses
+      (SELECT COUNT(*) FROM licenses
        WHERE telegram_id = $1
        AND status = 'active'
-       AND (expires_at IS NULL OR expires_at > NOW())
-      ) AS licenses_count`,
+       AND expires_at > NOW()) AS licenses_count`,
     [String(user.id)]
   );
 
   const stats = result.rows[0];
 
   const licenses = await pool.query(
-    `SELECT plan_code, license_key, expires_at
+    `SELECT license_key, plan_code, expires_at
      FROM licenses
      WHERE telegram_id = $1
-     AND status = 'active'
-     AND (expires_at IS NULL OR expires_at > NOW())
+       AND status = 'active'
+       AND expires_at > NOW()
      ORDER BY created_at DESC
      LIMIT 5`,
     [String(user.id)]
@@ -320,12 +659,8 @@ async function showProfile(chatId, user) {
       "\n\n🔑 АКТИВНЫЕ ЛИЦЕНЗИИ\n\n" +
       licenses.rows.map(item =>
         `Тариф: ${item.plan_code}\n` +
-        `Код: ${item.license_key}\n` +
-        `Действует до: ${
-          item.expires_at
-            ? new Date(item.expires_at).toLocaleDateString("ru-RU")
-            : "Без ограничения"
-        }`
+        `Ключ: ${item.license_key}\n` +
+        `До: ${new Date(item.expires_at).toLocaleDateString("ru-RU")}`
       ).join("\n\n");
   }
 
@@ -334,9 +669,7 @@ async function showProfile(chatId, user) {
     text:
       "👤 МОЙ ПРОФИЛЬ\n\n" +
       `Имя: ${user.first_name || "Пользователь"}\n` +
-      `Username: ${
-        user.username ? "@" + user.username : "не указан"
-      }\n` +
+      `Username: ${user.username ? "@" + user.username : "не указан"}\n` +
       `Telegram ID: ${user.id}\n\n` +
       `📦 Заказов: ${stats.orders_count}\n` +
       `🔑 Активных лицензий: ${stats.licenses_count}` +
@@ -346,7 +679,7 @@ async function showProfile(chatId, user) {
 }
 
 // ==========================================
-// ИСТОРИЯ ПОКУПОК
+// ИСТОРИЯ ЗАКАЗОВ
 // ==========================================
 
 async function showOrders(chatId, user) {
@@ -370,33 +703,24 @@ async function showOrders(chatId, user) {
   if (!result.rows.length) {
     await telegramRequest("sendMessage", {
       chat_id: chatId,
-      text:
-        "📦 У тебя пока нет покупок.\n\n" +
-        "Когда ты приобретёшь доступ, " +
-        "информация появится здесь.",
+      text: "📦 У тебя пока нет покупок.",
       reply_markup: shopMenu()
     });
 
     return;
   }
 
-  const text = result.rows.map(order => {
-    const date = new Date(order.created_at)
-      .toLocaleDateString("ru-RU");
-
-    return (
-      `📦 Заказ #${order.id}\n` +
-      `Тариф: ${order.product_code}\n` +
-      `Сумма: ${order.amount} ${order.currency}\n` +
-      `Статус: ${order.payment_status}\n` +
-      `Дата: ${date}` +
-      (
-        order.license_key
-          ? `\n🔑 Лицензия: ${order.license_key}`
-          : ""
-      )
-    );
-  }).join("\n\n");
+  const text = result.rows.map(order =>
+    `📦 Заказ #${order.id}\n` +
+    `Тариф: ${order.product_code}\n` +
+    `Сумма: ${order.amount} ${order.currency}\n` +
+    `Статус: ${order.payment_status}` +
+    (
+      order.license_key
+        ? `\n🔑 Лицензия: ${order.license_key}`
+        : ""
+    )
+  ).join("\n\n");
 
   await telegramRequest("sendMessage", {
     chat_id: chatId,
@@ -414,28 +738,39 @@ async function showSupport(chatId) {
     chat_id: chatId,
     text:
       "💬 ПОДДЕРЖКА\n\n" +
-      "Если возникли вопросы по приложению, " +
-      "напиши нам на почту:\n\n" +
-      "rus33rk@gmail.com\n\n" +
-      "Опиши проблему и приложи необходимые подробности.",
+      "По вопросам работы приложения:\n\n" +
+      "rus33rk@gmail.com",
     reply_markup: shopMenu()
   });
 }
 
 // ==========================================
-// ОБРАБОТКА TELEGRAM СООБЩЕНИЙ
+// TELEGRAM WEBHOOK
 // ==========================================
 
 async function handleTelegramUpdate(update) {
+  // Предварительная проверка платежа
+  if (update.pre_checkout_query) {
+    await handlePreCheckout(update.pre_checkout_query);
+    return;
+  }
+
   if (update.message) {
     const message = update.message;
     const user = message.from;
     const chatId = message.chat.id;
-    const command = (message.text || "").trim();
 
     if (!user) return;
 
     await saveTelegramCustomer(user);
+
+    // Успешная оплата
+    if (message.successful_payment) {
+      await handleSuccessfulPayment(message);
+      return;
+    }
+
+    const command = (message.text || "").trim();
 
     if (/^\/start(?:@\w+)?(?:\s|$)/i.test(command)) {
       await telegramRequest("sendMessage", {
@@ -443,9 +778,8 @@ async function handleTelegramUpdate(update) {
         text:
           `Привет, ${user.first_name || "друг"}! 👋\n\n` +
           "Добро пожаловать в Yandex Homework AI!\n\n" +
-          "Это официальный магазин мобильного приложения.\n\n" +
-          "Здесь можно будет приобретать доступ, " +
-          "управлять лицензиями и просматривать покупки.",
+          "Приобретай доступ к приложению, " +
+          "управляй покупками и лицензиями.",
         reply_markup: shopMenu()
       });
 
@@ -464,9 +798,7 @@ async function handleTelegramUpdate(update) {
 
     await telegramRequest("sendMessage", {
       chat_id: chatId,
-      text:
-        "Я помогу управлять покупками и лицензиями.\n\n" +
-        "Используй кнопки меню:",
+      text: "Выбери нужный раздел в меню:",
       reply_markup: shopMenu()
     });
 
@@ -486,36 +818,49 @@ async function handleTelegramUpdate(update) {
 
     await saveTelegramCustomer(user);
 
-    switch (query.data) {
-      case "shop_menu":
-        await sendShopMenu(chatId);
-        break;
+    if (query.data === "shop_menu") {
+      await sendShopMenu(chatId);
+      return;
+    }
 
-      case "shop_catalog":
-        await showCatalog(chatId);
-        break;
+    if (query.data === "shop_catalog") {
+      await showCatalog(chatId);
+      return;
+    }
 
-      case "shop_profile":
-        await showProfile(chatId, user);
-        break;
+    if (query.data === "shop_profile") {
+      await showProfile(chatId, user);
+      return;
+    }
 
-      case "shop_orders":
-        await showOrders(chatId, user);
-        break;
+    if (query.data === "shop_orders") {
+      await showOrders(chatId, user);
+      return;
+    }
 
-      case "shop_support":
-        await showSupport(chatId);
-        break;
+    if (query.data === "shop_support") {
+      await showSupport(chatId);
+      return;
+    }
 
-      default:
-        await sendShopMenu(chatId);
+    if (query.data.startsWith("buy_")) {
+      const planCode = query.data.replace("buy_", "");
+      const plan = PLANS[planCode];
+
+      if (!plan) {
+        await telegramRequest("sendMessage", {
+          chat_id: chatId,
+          text: "Такой тариф не найден.",
+          reply_markup: shopMenu()
+        });
+
+        return;
+      }
+
+      await createStarsInvoice(chatId, user, plan);
     }
   }
 }
-
-// ==========================================
-// TELEGRAM WEBHOOK
-// ==========================================
 
 app.post(TELEGRAM_WEBHOOK_PATH, async (req, res) => {
   if (!TELEGRAM_TOKEN || !TELEGRAM_SECRET) {
@@ -533,24 +878,18 @@ app.post(TELEGRAM_WEBHOOK_PATH, async (req, res) => {
     await handleTelegramUpdate(req.body);
     return res.sendStatus(200);
   } catch (error) {
-    console.error(
-      "Ошибка обработки Telegram:",
-      error.message
-    );
-
+    console.error("Telegram error:", error.message);
     return res.sendStatus(500);
   }
 });
 
 // ==========================================
-// АВТОМАТИЧЕСКАЯ НАСТРОЙКА WEBHOOK
+// НАСТРОЙКА WEBHOOK
 // ==========================================
 
 async function configureTelegramWebhook() {
   if (!TELEGRAM_TOKEN || !TELEGRAM_SECRET) {
-    console.warn(
-      "Telegram не настроен: отсутствуют переменные окружения"
-    );
+    console.warn("Telegram не настроен");
     return;
   }
 
@@ -563,23 +902,20 @@ async function configureTelegramWebhook() {
       secret_token: TELEGRAM_SECRET,
       allowed_updates: [
         "message",
-        "callback_query"
+        "callback_query",
+        "pre_checkout_query"
       ],
       drop_pending_updates: false
     });
 
-    console.log("Telegram webhook успешно настроен");
-    console.log("Webhook URL:", webhookUrl);
+    console.log("Telegram webhook настроен");
   } catch (error) {
-    console.error(
-      "Не удалось настроить Telegram webhook:",
-      error.message
-    );
+    console.error("Webhook error:", error.message);
   }
 }
 
 // ==========================================
-// РЕШЕНИЕ ШКОЛЬНЫХ ЗАДАНИЙ
+// РЕШЕНИЕ ЗАДАНИЙ
 // ==========================================
 
 app.post("/solve", async (req, res) => {
@@ -601,18 +937,14 @@ app.post("/solve", async (req, res) => {
     const instructions = `
 Ты — Yandex Homework AI, умный школьный помощник.
 
-Помогай ученикам по математике, физике, химии,
-биологии, русскому языку, литературе, истории,
-географии, информатике, английскому языку
-и другим школьным предметам.
+Помогай ученикам по школьным предметам.
 
 ОБЩИЕ ПРАВИЛА:
 1. Внимательно прочитай условие.
 2. Не выдумывай отсутствующие данные.
-3. Если условие неполное, укажи это.
-4. Объясняй решение последовательно.
-5. Проверяй вычисления.
-6. Отвечай на русском языке, если не попросили другой язык.
+3. Объясняй решение последовательно.
+4. Проверяй вычисления.
+5. Отвечай на русском языке, если не попросили другой.
 
 ОФОРМЛЕНИЕ:
 Если задача требует вычислений, используй:
@@ -629,15 +961,8 @@ app.post("/solve", async (req, res) => {
 Ответ:
 ...
 
-Не используй разделы Дано и Найти,
-если они не подходят к заданию.
+Не используй эти разделы, если они не подходят.
 
-Для программирования:
-- Объясни алгоритм.
-- Приведи рабочий код.
-- Объясни важные части кода.
-
-ВИЗУАЛЬНЫЕ МАТЕРИАЛЫ:
 Если задание требует схемы, графика,
 чертежа или диаграммы, передай информацию
 в поле visual.
@@ -649,27 +974,18 @@ app.post("/solve", async (req, res) => {
   "visual": null
 }
 
-Если нужна схема, visual должен иметь вид:
+Если нужна схема:
 
 {
-  "type": "geometry",
-  "title": "Название схемы",
-  "description": "Описание",
-  "scheme": "Текстовая схема",
-  "labels": [
-    {
-      "symbol": "A",
-      "meaning": "Обозначение точки A"
-    }
-  ]
+  "answer": "Решение",
+  "visual": {
+    "type": "geometry",
+    "title": "Название схемы",
+    "description": "Описание",
+    "scheme": "Текстовая схема",
+    "labels": []
+  }
 }
-
-Допустимые типы:
-geometry, graph, sentence_scheme,
-diagram, illustration.
-
-Если визуализация не нужна,
-верни visual: null.
 `;
 
     const response = await client.responses.create({
@@ -703,7 +1019,7 @@ diagram, illustration.
     });
 
   } catch (error) {
-    console.error("Ошибка /solve:", error);
+    console.error("Ошибка /solve:", error.message);
 
     return res.status(500).json({
       error: "Ошибка при решении задания"
@@ -712,7 +1028,7 @@ diagram, illustration.
 });
 
 // ==========================================
-// ГОЛОСОВОЙ И ТЕКСТОВЫЙ ПОМОЩНИК
+// ЧАТ И ГОЛОСОВОЙ ПОМОЩНИК
 // ==========================================
 
 app.post("/chat", async (req, res) => {
@@ -757,69 +1073,47 @@ app.post("/chat", async (req, res) => {
     const styleInstructions =
       mode === "Как друг"
         ? `
-ОБЩАЙСЯ КАК ДРУГ:
-- Будь дружелюбным и непринуждённым.
-- Объясняй простыми словами.
-- Не будь чрезмерно официальным.
-- Поддерживай собеседника.
-- Не злоупотребляй эмодзи.
-- Не называй пользователя ребёнком.
+Общайся как дружелюбный друг.
+Объясняй простыми словами.
+Будь непринуждённым.
 `
         : `
-ОБЩАЙСЯ КАК УЧИТЕЛЬ:
-- Будь спокойным и терпеливым.
-- Объясняй понятно и последовательно.
-- Мягко объясняй ошибки.
-- Помогай понять тему.
-- Не перегружай ответ.
+Общайся как спокойный и терпеливый учитель.
+Объясняй понятно и последовательно.
 `;
 
     const instructions = `
 Ты — голосовой и текстовый помощник
 приложения Yandex Homework AI.
 
-Ты можешь:
-- Отвечать на обычные вопросы.
-- Помогать с домашними заданиями.
-- Объяснять школьные темы.
-- Помогать с программированием.
-- Поддерживать разговор.
-- Давать понятные ответы для озвучивания.
-
 ${styleInstructions}
 
-ВАЖНО:
-- Отвечай на русском, если не попросили другой язык.
-- Не утверждай, что выполнил действие, если не выполнял.
-- Если не знаешь ответ, честно скажи об этом.
-- Учитывай историю диалога.
-- Не используй Markdown-таблицы для голосового общения.
-- Формулы при необходимости объясняй словами.
-- Не начинай каждый ответ с приветствия.
+Отвечай на русском, если не попросили другой язык.
+Учитывай историю диалога.
+Не используй Markdown-таблицы для голосового общения.
+Не утверждай, что выполнил действие, если не выполнял.
 `;
-
-    const input = [
-      ...history,
-      {
-        role: "user",
-        content: message
-      }
-    ];
 
     const response = await client.responses.create({
       model: MODEL,
       instructions,
-      input
+      input: [
+        ...history,
+        {
+          role: "user",
+          content: message
+        }
+      ]
     });
 
-    const answer = String(
-      response.output_text || "Не удалось сформировать ответ."
-    ).trim();
-
-    return res.json({ answer });
+    return res.json({
+      answer: String(
+        response.output_text || "Не удалось сформировать ответ."
+      ).trim()
+    });
 
   } catch (error) {
-    console.error("Ошибка /chat:", error);
+    console.error("Ошибка /chat:", error.message);
 
     return res.status(500).json({
       error: "Не удалось получить ответ помощника"
@@ -828,13 +1122,11 @@ ${styleInstructions}
 });
 
 // ==========================================
-// ЗАПУСК СЕРВЕРА
+// ЗАПУСК
 // ==========================================
 
 app.listen(PORT, "0.0.0.0", async () => {
-  console.log(
-    `Yandex Homework AI запущен на порту ${PORT}`
-  );
+  console.log(`Yandex Homework AI запущен на порту ${PORT}`);
 
   try {
     await initializeDatabase();
@@ -842,9 +1134,6 @@ app.listen(PORT, "0.0.0.0", async () => {
 
     console.log("Сервер полностью готов к работе");
   } catch (error) {
-    console.error(
-      "Ошибка подготовки сервера:",
-      error.message
-    );
+    console.error("Ошибка запуска:", error.message);
   }
 });
