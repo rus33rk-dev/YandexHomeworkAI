@@ -208,5 +208,41 @@
   $("activate-form").addEventListener("submit",activate);
   setTheme(localStorage.getItem("yhai_theme")!=="light");
   (async()=>{if(state.key&&await verifyLicense())await enterWorkspace();else{show("activation");hide("workspace");}})();
-  if("serviceWorker" in navigator) window.addEventListener("load",()=>navigator.serviceWorker.register("/sw.js").catch(()=>{}));
+  // PWA install: native prompt on supported browsers, clear Safari steps on iPhone.
+  let deferredInstallPrompt = null;
+  const installButton = $("install-app");
+  const installHelp = $("install-help");
+
+  window.addEventListener("beforeinstallprompt", event => {
+    event.preventDefault();
+    deferredInstallPrompt = event;
+    if (installButton) installButton.textContent = "Установить приложение";
+  });
+
+  if (window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true) {
+    if (installButton) installButton.textContent = "Приложение уже установлено";
+    if (installButton) installButton.disabled = true;
+    if (installHelp) installHelp.textContent = "Yandex Homework AI уже запущено как приложение.";
+  }
+
+  if (installButton) installButton.addEventListener("click", async () => {
+    if (window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true) return;
+    if (deferredInstallPrompt) {
+      deferredInstallPrompt.prompt();
+      await deferredInstallPrompt.userChoice;
+      deferredInstallPrompt = null;
+      return;
+    }
+    if (/iphone|ipad|ipod/i.test(navigator.userAgent)) {
+      alert("Чтобы установить приложение на iPhone:\\n\\n1. Открой этот сайт именно в Safari.\\n2. Нажми кнопку «Поделиться» (квадрат со стрелкой вверх).\\n3. Выбери «На экран Домой».\\n4. Нажми «Добавить».");
+    } else {
+      alert("Открой меню браузера и выбери «Установить приложение» или «Добавить на главный экран».");
+    }
+  });
+
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("/sw.js").catch(error => console.error("Service Worker:", error));
+    });
+  }
 })();

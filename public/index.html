@@ -4,9 +4,14 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#090a18">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Homework AI">
+  <meta name="mobile-web-app-capable" content="yes">
   <meta name="description" content="Yandex Homework AI — твой умный помощник">
   <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="apple-touch-icon" href="/icons/icon-192.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/icons/apple-touch-icon.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png">
   <link rel="stylesheet" href="/styles.css">
   <title>Yandex Homework AI</title>
 </head>
@@ -106,6 +111,11 @@
             <button class="menu-row" id="settings-open"><span>⚙</span><span><b>Настройки</b><small>Тема, камера и отклик</small></span><i>›</i></button>
             <button class="menu-row" id="about-open"><span>ⓘ</span><span><b>О приложении</b><small>Возможности и описание</small></span><i>›</i></button>
             <a class="menu-row" href="mailto:rus33rk@gmail.com?subject=Поддержка%20Yandex%20Homework%20AI"><span>✉</span><span><b>Поддержка</b><small>Написать разработчику</small></span><i>›</i></a>
+          </div>
+          <div class="panel install-panel">
+            <div><b>Установка приложения</b><small class="muted">Добавь Yandex Homework AI на главный экран</small></div>
+            <button id="install-app" class="secondary">Установить приложение</button>
+            <p id="install-help" class="tiny muted">На iPhone открой сайт в Safari, нажми «Поделиться», затем «На экран Домой».</p>
           </div>
           <div class="panel license-panel">
             <div><b>Лицензия</b><span id="license-state" class="status-dot">Проверяется</span></div>
