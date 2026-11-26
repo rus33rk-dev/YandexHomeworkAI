@@ -403,7 +403,6 @@ app.post("/license/activate", async (req, res) => {
        FOR UPDATE OF l`,
       [licenseKey]
     );
-        );
 
     const license = result.rows[0];
 
