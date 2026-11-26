@@ -385,7 +385,7 @@ app.post("/license/activate", async (req, res) => {
   try {
     await db.query("BEGIN");
 
-    const result = await db.query(
+        const result = await db.query(
       `SELECT
          l.id,
          l.license_key,
