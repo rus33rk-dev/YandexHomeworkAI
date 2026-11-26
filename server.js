@@ -281,13 +281,16 @@ async function findValidLicense(licenseKey, deviceId) {
     };
   }
 
-  const allowedDevices = Array.isArray(license.device_ids)
+  const allowedDeviceIds = Array.isArray(license.device_ids)
     ? license.device_ids
     : [];
-  const legacyDeviceAllowed =
-    license.device_id && license.device_id === deviceId;
 
-  if (!allowedDevices.includes(deviceId) && !legacyDeviceAllowed) {
+  // Совместимость со старыми лицензиями, у которых сохранён только device_id.
+  if (license.device_id && !allowedDeviceIds.includes(license.device_id)) {
+    allowedDeviceIds.push(license.device_id);
+  }
+
+  if (!allowedDeviceIds.includes(deviceId)) {
     return {
       valid: false,
       reason: "device_mismatch"
@@ -400,6 +403,7 @@ app.post("/license/activate", async (req, res) => {
        FOR UPDATE OF l`,
       [licenseKey]
     );
+        );
 
     const license = result.rows[0];
 
@@ -427,7 +431,7 @@ app.post("/license/activate", async (req, res) => {
     }
 
     if (license.status !== "active") {
-            await db.query("ROLLBACK");
+      await db.query("ROLLBACK");
 
       return res.status(403).json({
         success: false,
@@ -467,36 +471,39 @@ app.post("/license/activate", async (req, res) => {
       });
     }
 
-    const registeredDevices = Array.isArray(license.device_ids)
-      ? license.device_ids.filter(Boolean)
+    const allowedDeviceIds = Array.isArray(license.device_ids)
+      ? [...license.device_ids]
       : [];
 
-    if (license.device_id && !registeredDevices.includes(license.device_id)) {
-      registeredDevices.push(license.device_id);
+    // Подхватываем первую привязку из старого поля device_id.
+    if (
+      license.device_id &&
+      !allowedDeviceIds.includes(license.device_id)
+    ) {
+      allowedDeviceIds.push(license.device_id);
     }
 
-    const uniqueDevices = [...new Set(registeredDevices)];
-
-    if (!uniqueDevices.includes(deviceId)) {
-      if (uniqueDevices.length >= 2) {
+    // Повторная активация на уже привязанном устройстве разрешена.
+    if (!allowedDeviceIds.includes(deviceId)) {
+      if (allowedDeviceIds.length >= 2) {
         await db.query("ROLLBACK");
 
         return res.status(409).json({
           success: false,
-          error: "Эта лицензия уже активирована на двух устройствах. Обратись в поддержку, если нужно заменить устройство.",
+          error: "Лицензия уже активирована на двух устройствах. Обратись в поддержку для сброса привязки.",
           code: "DEVICE_LIMIT_REACHED"
         });
       }
 
-      uniqueDevices.push(deviceId);
+      allowedDeviceIds.push(deviceId);
     }
 
     await db.query(
       `UPDATE licenses
-       SET device_ids = $2::TEXT[],
+       SET device_ids = $2::text[],
            device_id = COALESCE(device_id, $3)
        WHERE id = $1`,
-      [license.id, uniqueDevices, deviceId]
+      [license.id, allowedDeviceIds, deviceId]
     );
 
     await db.query("COMMIT");
@@ -806,7 +813,6 @@ async function handlePreCheckout(query) {
     ok: true
   });
 }
-
 // ==========================================
 // ГЕНЕРАЦИЯ ЛИЦЕНЗИИ
 // ==========================================
@@ -847,7 +853,8 @@ async function handleSuccessfulPayment(message) {
   const db = await pool.connect();
 
   let license;
-    try {
+
+  try {
     await db.query("BEGIN");
 
     const orderResult = await db.query(
@@ -1215,7 +1222,7 @@ async function showOrders(chatId, user) {
 async function showSupport(chatId) {
   await telegramRequest("sendMessage", {
     chat_id: chatId,
-    text:
+        text:
       "💬 ПОДДЕРЖКА\n\n" +
       "По вопросам работы приложения:\n\n" +
       "rus33rk@gmail.com",
@@ -1246,7 +1253,8 @@ async function handleTelegramUpdate(update) {
       await handleSuccessfulPayment(message);
       return;
     }
-        const command = (message.text || "").trim();
+
+    const command = (message.text || "").trim();
 
     if (/^\/start(?:@\w+)?(?:\s|$)/i.test(command)) {
       await telegramRequest("sendMessage", {
@@ -1625,3 +1633,4 @@ app.listen(PORT, "0.0.0.0", async () => {
     console.error("Ошибка запуска:", error.message);
   }
 });
+    
