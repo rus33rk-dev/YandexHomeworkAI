@@ -1,4 +1,3 @@
-
 require("dotenv").config();
 
 const express = require("express");
@@ -135,6 +134,11 @@ async function initializeDatabase() {
 
     ALTER TABLE orders
       ADD COLUMN IF NOT EXISTS telegram_payment_charge_id TEXT;
+
+    -- Привязка лицензии к одному устройству.
+    -- У существующих лицензий поле будет пустым до первой активации.
+    ALTER TABLE licenses
+      ADD COLUMN IF NOT EXISTS device_id TEXT;
   `);
 
   console.log("PostgreSQL: база готова");
@@ -151,7 +155,7 @@ app.use((req, res, next) => {
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.header(
     "Access-Control-Allow-Headers",
-    "Content-Type, Authorization"
+    "Content-Type, Authorization, X-Device-ID"
   );
 
   if (req.method === "OPTIONS") {
@@ -159,6 +163,361 @@ app.use((req, res, next) => {
   }
 
   next();
+});
+
+// ==========================================
+// ЛИЦЕНЗИИ И ЗАЩИТА API
+// ==========================================
+
+function normalizeLicenseKey(value) {
+  return String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, "");
+}
+
+function getBearerToken(req) {
+  const header = String(req.headers.authorization || "");
+  const match = /^Bearer\s+(.+)$/i.exec(header);
+  return match ? normalizeLicenseKey(match[1]) : "";
+}
+
+function getDeviceId(req) {
+  return String(req.headers["x-device-id"] || "").trim();
+}
+
+/**
+ * Проверяет, что лицензия:
+ * - существует;
+ * - активна и не просрочена;
+ * - принадлежит настоящему оплаченному заказу Telegram Stars;
+ * - привязана к тому устройству, с которого пришёл запрос.
+ *
+ * admin_test намеренно не считается настоящей оплатой.
+ */
+async function findValidLicense(licenseKey, deviceId) {
+  if (!licenseKey || !deviceId) {
+    return {
+      valid: false,
+      reason: "missing_credentials"
+    };
+  }
+
+  const result = await pool.query(
+    `SELECT
+       l.id,
+       l.license_key,
+       l.plan_code,
+       l.starts_at,
+       l.expires_at,
+       l.status,
+       l.device_id,
+       o.payment_provider,
+       o.payment_status
+     FROM licenses l
+     INNER JOIN orders o ON o.id = l.order_id
+     WHERE l.license_key = $1
+     LIMIT 1`,
+    [licenseKey]
+  );
+
+  const license = result.rows[0];
+
+  if (!license) {
+    return {
+      valid: false,
+      reason: "license_not_found"
+    };
+  }
+
+  // Тестовые покупки и любые не подтверждённые платежи
+  // не открывают доступ к рабочему API.
+  if (
+    license.payment_provider !== "telegram_stars" ||
+    license.payment_status !== "paid"
+  ) {
+    return {
+      valid: false,
+      reason: "payment_not_valid"
+    };
+  }
+
+  if (license.status !== "active") {
+    return {
+      valid: false,
+      reason: "license_inactive"
+    };
+  }
+
+  const now = Date.now();
+  const startsAt = license.starts_at
+    ? new Date(license.starts_at).getTime()
+    : 0;
+  const expiresAt = license.expires_at
+    ? new Date(license.expires_at).getTime()
+    : 0;
+
+  if (
+    !Number.isFinite(expiresAt) ||
+    expiresAt <= now ||
+    (startsAt && startsAt > now)
+  ) {
+    if (expiresAt && expiresAt <= now) {
+      await pool.query(
+        `UPDATE licenses
+         SET status = 'expired'
+         WHERE id = $1 AND status = 'active'`,
+        [license.id]
+      );
+    }
+
+    return {
+      valid: false,
+      reason: "license_expired"
+    };
+  }
+
+  if (!license.device_id || license.device_id !== deviceId) {
+    return {
+      valid: false,
+      reason: "device_mismatch"
+    };
+  }
+
+  return {
+    valid: true,
+    license: {
+      key: license.license_key,
+      planCode: license.plan_code,
+      expiresAt: license.expires_at
+    }
+  };
+}
+
+/**
+ * Middleware для всех платных функций приложения.
+ * Ключ лицензии и ID устройства передаются в заголовках.
+ */
+async function requireLicense(req, res, next) {
+  try {
+    const licenseKey = getBearerToken(req);
+    const deviceId = getDeviceId(req);
+
+    if (!licenseKey || !deviceId) {
+      return res.status(401).json({
+        error: "Для использования приложения нужна активная лицензия.",
+        code: "LICENSE_REQUIRED"
+      });
+    }
+
+    const result = await findValidLicense(licenseKey, deviceId);
+
+    if (!result.valid) {
+      const statusCode =
+        result.reason === "device_mismatch" ? 409 : 403;
+
+      const messages = {
+        license_not_found: "Лицензия не найдена.",
+        payment_not_valid: "Эта лицензия не подтверждена реальной оплатой.",
+        license_inactive: "Лицензия отключена.",
+        license_expired: "Срок действия подписки закончился.",
+        device_mismatch: "Лицензия уже привязана к другому устройству.",
+        missing_credentials: "Не переданы данные лицензии."
+      };
+
+      return res.status(statusCode).json({
+        error: messages[result.reason] || "Нет доступа.",
+        code: result.reason === "license_expired"
+          ? "LICENSE_EXPIRED"
+          : result.reason === "device_mismatch"
+            ? "DEVICE_MISMATCH"
+            : "LICENSE_INVALID"
+      });
+    }
+
+    req.license = result.license;
+    next();
+  } catch (error) {
+    console.error("Ошибка проверки лицензии:", error.message);
+
+    return res.status(500).json({
+      error: "Не удалось проверить лицензию.",
+      code: "LICENSE_CHECK_ERROR"
+    });
+  }
+}
+
+// ==========================================
+// АКТИВАЦИЯ ЛИЦЕНЗИИ
+// ==========================================
+
+app.post("/license/activate", async (req, res) => {
+  const licenseKey = normalizeLicenseKey(req.body?.licenseKey);
+  const deviceId = String(req.body?.deviceId || "").trim();
+
+  if (!licenseKey || !deviceId) {
+    return res.status(400).json({
+      success: false,
+      error: "Введи лицензионный ключ и повтори попытку.",
+      code: "MISSING_DATA"
+    });
+  }
+
+  if (licenseKey.length > 100 || deviceId.length > 200) {
+    return res.status(400).json({
+      success: false,
+      error: "Некорректные данные активации.",
+      code: "INVALID_DATA"
+    });
+  }
+
+  const db = await pool.connect();
+
+  try {
+    await db.query("BEGIN");
+
+    const result = await db.query(
+      `SELECT
+         l.id,
+         l.license_key,
+         l.plan_code,
+         l.starts_at,
+         l.expires_at,
+         l.status,
+         l.device_id,
+         o.payment_provider,
+         o.payment_status
+       FROM licenses l
+       INNER JOIN orders o ON o.id = l.order_id
+       WHERE l.license_key = $1
+       FOR UPDATE OF l`,
+      [licenseKey]
+    );
+
+    const license = result.rows[0];
+
+    if (!license) {
+      await db.query("ROLLBACK");
+
+      return res.status(404).json({
+        success: false,
+        error: "Такой лицензионный ключ не найден.",
+        code: "LICENSE_NOT_FOUND"
+      });
+    }
+
+    // Запрещаем активировать тестовые ключи администратора.
+    if (
+      license.payment_provider !== "telegram_stars" ||
+      license.payment_status !== "paid"
+    ) {
+      await db.query("ROLLBACK");
+
+      return res.status(403).json({
+        success: false,
+        error: "Этот ключ создан для тестирования и не открывает доступ к приложению.",
+        code: "TEST_LICENSE"
+      });
+    }
+
+    if (license.status !== "active") {
+      await db.query("ROLLBACK");
+
+      return res.status(403).json({
+        success: false,
+        error: "Эта лицензия отключена.",
+        code: "LICENSE_INACTIVE"
+      });
+    }
+
+    const now = Date.now();
+    const startsAt = license.starts_at
+      ? new Date(license.starts_at).getTime()
+      : 0;
+    const expiresAt = license.expires_at
+      ? new Date(license.expires_at).getTime()
+      : 0;
+
+    if (
+      !Number.isFinite(expiresAt) ||
+      expiresAt <= now ||
+      (startsAt && startsAt > now)
+    ) {
+      if (expiresAt && expiresAt <= now) {
+        await db.query(
+          `UPDATE licenses
+           SET status = 'expired'
+           WHERE id = $1`,
+          [license.id]
+        );
+      }
+
+      await db.query("COMMIT");
+
+      return res.status(403).json({
+        success: false,
+        error: "Срок действия этой подписки закончился.",
+        code: "LICENSE_EXPIRED"
+      });
+    }
+
+    if (license.device_id && license.device_id !== deviceId) {
+      await db.query("ROLLBACK");
+
+      return res.status(409).json({
+        success: false,
+        error: "Этот ключ уже активирован на другом устройстве. Обратись в поддержку для сброса привязки.",
+        code: "DEVICE_MISMATCH"
+      });
+    }
+
+    if (!license.device_id) {
+      await db.query(
+        `UPDATE licenses
+         SET device_id = $2
+         WHERE id = $1 AND device_id IS NULL`,
+        [license.id, deviceId]
+      );
+    }
+
+    await db.query("COMMIT");
+
+    return res.json({
+      success: true,
+      message: "Лицензия успешно активирована.",
+      license: {
+        key: license.license_key,
+        planCode: license.plan_code,
+        expiresAt: license.expires_at
+      }
+    });
+  } catch (error) {
+    try {
+      await db.query("ROLLBACK");
+    } catch (_) {}
+
+    console.error("Ошибка /license/activate:", error.message);
+
+    return res.status(500).json({
+      success: false,
+      error: "Не удалось активировать лицензию. Попробуй позже.",
+      code: "ACTIVATION_ERROR"
+    });
+  } finally {
+    db.release();
+  }
+});
+
+// ==========================================
+// ПРОВЕРКА УЖЕ АКТИВИРОВАННОЙ ЛИЦЕНЗИИ
+// ==========================================
+
+app.get("/license/verify", requireLicense, (req, res) => {
+  res.json({
+    success: true,
+    active: true,
+    license: req.license
+  });
 });
 
 // ==========================================
@@ -330,7 +689,7 @@ async function showCatalog(chatId) {
     ]
   ];
 
-  // Тестовая кнопка доступна только администратору
+  // Тестовая кнопка доступна только администратору.
   if (
     ADMIN_TELEGRAM_ID &&
     String(chatId) === String(ADMIN_TELEGRAM_ID)
@@ -616,7 +975,10 @@ async function handleSuccessfulPayment(message) {
       console.log(`Оплата подтверждена. Заказ ${orderId}`);
     }
   } catch (error) {
-    await db.query("ROLLBACK");
+    try {
+      await db.query("ROLLBACK");
+    } catch (_) {}
+
     throw error;
   } finally {
     db.release();
@@ -728,7 +1090,10 @@ async function createAdminTestPurchase(user, chatId) {
 
     console.log(`Тестовая покупка создана. Заказ ${orderId}`);
   } catch (error) {
-    await db.query("ROLLBACK");
+    try {
+      await db.query("ROLLBACK");
+    } catch (_) {}
+
     throw error;
   } finally {
     db.release();
@@ -746,7 +1111,7 @@ async function createAdminTestPurchase(user, chatId) {
       "📅 Тариф: 1 месяц\n" +
       "⏳ Действует до: " +
       new Date(license.expires_at).toLocaleDateString("ru-RU") +
-      "\n\n🧪 Это тестовая покупка.",
+      "\n\n🧪 Это тестовая покупка. Она не открывает доступ к приложению.",
     reply_markup: shopMenu()
   });
 }
@@ -771,12 +1136,14 @@ async function showProfile(chatId, user) {
   const stats = result.rows[0];
 
   const licenses = await pool.query(
-    `SELECT license_key, plan_code, expires_at
-     FROM licenses
-     WHERE telegram_id = $1
-       AND status = 'active'
-       AND expires_at > NOW()
-     ORDER BY created_at DESC
+    `SELECT l.license_key, l.plan_code, l.expires_at,
+            o.payment_provider
+     FROM licenses l
+     LEFT JOIN orders o ON o.id = l.order_id
+     WHERE l.telegram_id = $1
+       AND l.status = 'active'
+       AND l.expires_at > NOW()
+     ORDER BY l.created_at DESC
      LIMIT 5`,
     [String(user.id)]
   );
@@ -787,6 +1154,7 @@ async function showProfile(chatId, user) {
     licenseText =
       "\n\n🔑 АКТИВНЫЕ ЛИЦЕНЗИИ\n\n" +
       licenses.rows.map(item =>
+        `${item.payment_provider === "admin_test" ? "🧪 ТЕСТОВАЯ ЛИЦЕНЗИЯ\n" : ""}` +
         `Тариф: ${item.plan_code}\n` +
         `Ключ: ${item.license_key}\n` +
         `До: ${new Date(item.expires_at).toLocaleDateString("ru-RU")}`
@@ -951,7 +1319,7 @@ async function handleTelegramUpdate(update) {
 
     await saveTelegramCustomer(user);
 
-    // Тестовая покупка — только для администратора
+    // Тестовая покупка — только для администратора.
     if (query.data === "admin_test_month") {
       if (
         !ADMIN_TELEGRAM_ID ||
@@ -1064,7 +1432,7 @@ async function configureTelegramWebhook() {
 // РЕШЕНИЕ ЗАДАНИЙ
 // ==========================================
 
-app.post("/solve", async (req, res) => {
+app.post("/solve", requireLicense, async (req, res) => {
   try {
     const task = String(req.body?.task || "").trim();
 
@@ -1177,7 +1545,7 @@ app.post("/solve", async (req, res) => {
 // ЧАТ И ГОЛОСОВОЙ ПОМОЩНИК
 // ==========================================
 
-app.post("/chat", async (req, res) => {
+app.post("/chat", requireLicense, async (req, res) => {
   try {
     const message = String(
       req.body?.message || ""
