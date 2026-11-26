@@ -1,7 +1,9 @@
+
 require("dotenv").config();
 
 const express = require("express");
 const OpenAI = require("openai");
+const { Pool } = require("pg");
 
 const app = express();
 const PORT = process.env.PORT || 3210;
@@ -15,12 +17,97 @@ const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
+const MODEL = process.env.OPENAI_MODEL || "gpt-6.2-astra";
+
+// ==========================================
+// POSTGRESQL — БАЗА ДАННЫХ МАГАЗИНА
+// ==========================================
+
+const pool = process.env.DATABASE_URL
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: {
+        rejectUnauthorized: false
+      },
+      max: 5,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000
+    })
+  : null;
+
+if (!pool) {
+  console.warn("DATABASE_URL не найден. Магазин не подключён.");
+}
+
+if (pool) {
+  pool.on("error", (error) => {
+    console.error("Ошибка PostgreSQL:", error.message);
+  });
+}
+
+// Создание таблиц
+async function initializeDatabase() {
+  if (!pool) {
+    throw new Error("DATABASE_URL не настроен");
+  }
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS customers (
+      telegram_id BIGINT PRIMARY KEY,
+      username TEXT,
+      first_name TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS orders (
+      id BIGSERIAL PRIMARY KEY,
+      telegram_id BIGINT NOT NULL
+        REFERENCES customers(telegram_id),
+      product_code TEXT NOT NULL,
+      amount INTEGER NOT NULL,
+      currency TEXT NOT NULL DEFAULT 'RUB',
+      payment_provider TEXT,
+      payment_status TEXT NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      paid_at TIMESTAMPTZ
+    );
+
+    CREATE TABLE IF NOT EXISTS licenses (
+      id BIGSERIAL PRIMARY KEY,
+      license_key TEXT UNIQUE NOT NULL,
+      telegram_id BIGINT NOT NULL
+        REFERENCES customers(telegram_id),
+      order_id BIGINT UNIQUE REFERENCES orders(id),
+      plan_code TEXT NOT NULL,
+      starts_at TIMESTAMPTZ,
+      expires_at TIMESTAMPTZ,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_orders_telegram_id
+    ON orders(telegram_id);
+
+    CREATE INDEX IF NOT EXISTS idx_licenses_telegram_id
+    ON licenses(telegram_id);
+  `);
+
+  console.log("База данных магазина успешно подготовлена");
+}
+
+// ==========================================
+// MIDDLEWARE
+// ==========================================
+
 app.use(express.json({ limit: "2mb" }));
 
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.header(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization"
+  );
 
   if (req.method === "OPTIONS") {
     return res.sendStatus(204);
@@ -29,9 +116,10 @@ app.use((req, res, next) => {
   next();
 });
 
-const MODEL = process.env.OPENAI_MODEL || "gpt-6.2-astra";
+// ==========================================
+// ПРОВЕРКА СЕРВЕРА
+// ==========================================
 
-// Проверка сервера
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
@@ -39,7 +127,40 @@ app.get("/health", (req, res) => {
   });
 });
 
-// Решение школьных заданий
+// ==========================================
+// ПРОВЕРКА БАЗЫ ДАННЫХ
+// ==========================================
+
+app.get("/db-health", async (req, res) => {
+  try {
+    if (!pool) {
+      return res.status(503).json({
+        status: "error",
+        database: "not_configured"
+      });
+    }
+
+    await pool.query("SELECT 1");
+
+    return res.json({
+      status: "ok",
+      database: "connected"
+    });
+
+  } catch (error) {
+    console.error("Ошибка /db-health:", error.message);
+
+    return res.status(500).json({
+      status: "error",
+      database: "disconnected"
+    });
+  }
+});
+
+// ==========================================
+// РЕШЕНИЕ ШКОЛЬНЫХ ЗАДАНИЙ
+// ==========================================
+
 app.post("/solve", async (req, res) => {
   try {
     const task = String(req.body?.task || "").trim();
@@ -147,6 +268,7 @@ geometry, graph, sentence_scheme, diagram, illustration.
         .trim();
 
       parsed = JSON.parse(cleaned);
+
     } catch (error) {
       parsed = {
         answer: output || "Не удалось получить ответ.",
@@ -168,7 +290,10 @@ geometry, graph, sentence_scheme, diagram, illustration.
   }
 });
 
-// Голосовой и текстовый помощник
+// ==========================================
+// ГОЛОСОВОЙ И ТЕКСТОВЫЙ ПОМОЩНИК
+// ==========================================
+
 app.post("/chat", async (req, res) => {
   try {
     const message = String(req.body?.message || "").trim();
@@ -190,8 +315,6 @@ app.post("/chat", async (req, res) => {
       });
     }
 
-    // Оставляем только последние сообщения
-    // и разрешённые роли, чтобы не передавать лишние данные.
     const history = incomingHistory
       .filter(item =>
         item &&
@@ -277,6 +400,17 @@ ${styleInstructions}
   }
 });
 
+// ==========================================
+// ЗАПУСК СЕРВЕРА
+// ==========================================
+
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Yandex Homework AI запущен на порту ${PORT}`);
+
+  initializeDatabase().catch(error => {
+    console.error(
+      "Не удалось подготовить базу данных:",
+      error.message
+    );
+  });
 });
