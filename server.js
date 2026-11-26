@@ -1,4 +1,3 @@
-
 require("dotenv").config();
 
 const express = require("express");
@@ -139,6 +138,15 @@ async function initializeDatabase() {
 
     ALTER TABLE licenses
       ADD COLUMN IF NOT EXISTS device_id TEXT;
+
+    ALTER TABLE licenses
+      ADD COLUMN IF NOT EXISTS device_ids TEXT[] NOT NULL DEFAULT '{}';
+
+    UPDATE licenses
+    SET device_ids = ARRAY[device_id]
+    WHERE device_id IS NOT NULL
+      AND device_id <> ''
+      AND NOT (device_ids @> ARRAY[device_id]);
   `);
 
   console.log("PostgreSQL: база готова");
@@ -209,6 +217,7 @@ async function findValidLicense(licenseKey, deviceId) {
        l.expires_at,
        l.status,
        l.device_id,
+       l.device_ids,
        o.payment_provider,
        o.payment_status
      FROM licenses l
@@ -272,7 +281,13 @@ async function findValidLicense(licenseKey, deviceId) {
     };
   }
 
-  if (!license.device_id || license.device_id !== deviceId) {
+  const allowedDevices = Array.isArray(license.device_ids)
+    ? license.device_ids
+    : [];
+  const legacyDeviceAllowed =
+    license.device_id && license.device_id === deviceId;
+
+  if (!allowedDevices.includes(deviceId) && !legacyDeviceAllowed) {
     return {
       valid: false,
       reason: "device_mismatch"
@@ -376,6 +391,7 @@ app.post("/license/activate", async (req, res) => {
          l.expires_at,
          l.status,
          l.device_id,
+         l.device_ids,
          o.payment_provider,
          o.payment_status
        FROM licenses l
@@ -411,7 +427,7 @@ app.post("/license/activate", async (req, res) => {
     }
 
     if (license.status !== "active") {
-      await db.query("ROLLBACK");
+            await db.query("ROLLBACK");
 
       return res.status(403).json({
         success: false,
@@ -451,24 +467,37 @@ app.post("/license/activate", async (req, res) => {
       });
     }
 
-    if (license.device_id && license.device_id !== deviceId) {
-      await db.query("ROLLBACK");
+    const registeredDevices = Array.isArray(license.device_ids)
+      ? license.device_ids.filter(Boolean)
+      : [];
 
-      return res.status(409).json({
-        success: false,
-        error: "Этот ключ уже активирован на другом устройстве. Обратись в поддержку для сброса привязки.",
-        code: "DEVICE_MISMATCH"
-      });
+    if (license.device_id && !registeredDevices.includes(license.device_id)) {
+      registeredDevices.push(license.device_id);
     }
 
-    if (!license.device_id) {
-      await db.query(
-        `UPDATE licenses
-         SET device_id = $2
-         WHERE id = $1 AND device_id IS NULL`,
-        [license.id, deviceId]
-      );
+    const uniqueDevices = [...new Set(registeredDevices)];
+
+    if (!uniqueDevices.includes(deviceId)) {
+      if (uniqueDevices.length >= 2) {
+        await db.query("ROLLBACK");
+
+        return res.status(409).json({
+          success: false,
+          error: "Эта лицензия уже активирована на двух устройствах. Обратись в поддержку, если нужно заменить устройство.",
+          code: "DEVICE_LIMIT_REACHED"
+        });
+      }
+
+      uniqueDevices.push(deviceId);
     }
+
+    await db.query(
+      `UPDATE licenses
+       SET device_ids = $2::TEXT[],
+           device_id = COALESCE(device_id, $3)
+       WHERE id = $1`,
+      [license.id, uniqueDevices, deviceId]
+    );
 
     await db.query("COMMIT");
 
@@ -818,8 +847,7 @@ async function handleSuccessfulPayment(message) {
   const db = await pool.connect();
 
   let license;
-
-  try {
+    try {
     await db.query("BEGIN");
 
     const orderResult = await db.query(
@@ -1218,8 +1246,7 @@ async function handleTelegramUpdate(update) {
       await handleSuccessfulPayment(message);
       return;
     }
-
-    const command = (message.text || "").trim();
+        const command = (message.text || "").trim();
 
     if (/^\/start(?:@\w+)?(?:\s|$)/i.test(command)) {
       await telegramRequest("sendMessage", {
