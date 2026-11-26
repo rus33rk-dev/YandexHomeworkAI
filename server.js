@@ -12,6 +12,8 @@ const MODEL = process.env.OPENAI_MODEL || "gpt-6.2-astra";
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET;
+const ADMIN_TELEGRAM_ID = process.env.ADMIN_TELEGRAM_ID;
+
 const TELEGRAM_WEBHOOK_PATH = "/telegram/webhook";
 
 const PUBLIC_URL =
@@ -301,42 +303,58 @@ async function showCatalog(chatId) {
     "Оплата банковской картой будет добавлена отдельно.\n" +
     "Сейчас доступна оплата Telegram Stars.";
 
+  const keyboard = [
+    [
+      {
+        text: "1 месяц — 100 ⭐",
+        callback_data: "buy_month"
+      }
+    ],
+    [
+      {
+        text: "3 месяца — 270 ⭐",
+        callback_data: "buy_three_months"
+      }
+    ],
+    [
+      {
+        text: "6 месяцев — 470 ⭐",
+        callback_data: "buy_six_months"
+      }
+    ],
+    [
+      {
+        text: "12 месяцев — 740 ⭐",
+        callback_data: "buy_year"
+      }
+    ]
+  ];
+
+  // Тестовая кнопка доступна только администратору
+  if (
+    ADMIN_TELEGRAM_ID &&
+    String(chatId) === String(ADMIN_TELEGRAM_ID)
+  ) {
+    keyboard.push([
+      {
+        text: "🧪 ТЕСТОВАЯ ПОКУПКА (без оплаты)",
+        callback_data: "admin_test_month"
+      }
+    ]);
+  }
+
+  keyboard.push([
+    {
+      text: "↩️ Главное меню",
+      callback_data: "shop_menu"
+    }
+  ]);
+
   await telegramRequest("sendMessage", {
     chat_id: chatId,
     text,
     reply_markup: {
-      inline_keyboard: [
-        [
-          {
-            text: "1 месяц — 100 ⭐",
-            callback_data: "buy_month"
-          }
-        ],
-        [
-          {
-            text: "3 месяца — 270 ⭐",
-            callback_data: "buy_three_months"
-          }
-        ],
-        [
-          {
-            text: "6 месяцев — 470 ⭐",
-            callback_data: "buy_six_months"
-          }
-        ],
-        [
-          {
-            text: "12 месяцев — 740 ⭐",
-            callback_data: "buy_year"
-          }
-        ],
-        [
-          {
-            text: "↩️ Главное меню",
-            callback_data: "shop_menu"
-          }
-        ]
-      ]
+      inline_keyboard: keyboard
     }
   });
 }
@@ -623,6 +641,117 @@ async function handleSuccessfulPayment(message) {
 }
 
 // ==========================================
+// АДМИНСКАЯ ТЕСТОВАЯ ПОКУПКА
+// ==========================================
+
+async function createAdminTestPurchase(user, chatId) {
+  if (
+    !ADMIN_TELEGRAM_ID ||
+    String(user.id) !== String(ADMIN_TELEGRAM_ID)
+  ) {
+    throw new Error("Нет доступа к тестовой покупке");
+  }
+
+  const plan = PLANS.month;
+  const db = await pool.connect();
+
+  let license;
+
+  try {
+    await db.query("BEGIN");
+
+    const customer = await db.query(
+      `SELECT telegram_id
+       FROM customers
+       WHERE telegram_id = $1`,
+      [String(user.id)]
+    );
+
+    if (!customer.rows.length) {
+      throw new Error("Пользователь не найден");
+    }
+
+    const orderResult = await db.query(
+      `INSERT INTO orders (
+        telegram_id,
+        product_code,
+        amount,
+        currency,
+        payment_provider,
+        payment_status,
+        paid_at
+      )
+      VALUES ($1, $2, $3, 'XTR', 'admin_test', 'paid', NOW())
+      RETURNING id`,
+      [
+        String(user.id),
+        plan.code,
+        plan.stars
+      ]
+    );
+
+    const orderId = orderResult.rows[0].id;
+    const licenseKey = generateLicenseKey();
+
+    const licenseResult = await db.query(
+      `INSERT INTO licenses (
+        license_key,
+        telegram_id,
+        order_id,
+        plan_code,
+        starts_at,
+        expires_at,
+        status
+      )
+      VALUES (
+        $1,
+        $2,
+        $3,
+        $4,
+        NOW(),
+        NOW() + make_interval(months => $5),
+        'active'
+      )
+      RETURNING license_key, expires_at`,
+      [
+        licenseKey,
+        String(user.id),
+        orderId,
+        plan.code,
+        plan.months
+      ]
+    );
+
+    license = licenseResult.rows[0];
+
+    await db.query("COMMIT");
+
+    console.log(`Тестовая покупка создана. Заказ ${orderId}`);
+  } catch (error) {
+    await db.query("ROLLBACK");
+    throw error;
+  } finally {
+    db.release();
+  }
+
+  await telegramRequest("sendMessage", {
+    chat_id: chatId,
+    text:
+      "🧪 ТЕСТОВАЯ ПОКУПКА УСПЕШНА!\n\n" +
+      "Реальные Stars не списывались.\n\n" +
+      "📦 Заказ записан в Neon.\n" +
+      "💳 Статус: paid\n\n" +
+      "🔑 ЛИЦЕНЗИЯ:\n" +
+      license.license_key + "\n\n" +
+      "📅 Тариф: 1 месяц\n" +
+      "⏳ Действует до: " +
+      new Date(license.expires_at).toLocaleDateString("ru-RU") +
+      "\n\n🧪 Это тестовая покупка.",
+    reply_markup: shopMenu()
+  });
+}
+
+// ==========================================
 // ПРОФИЛЬ
 // ==========================================
 
@@ -689,6 +818,7 @@ async function showOrders(chatId, user) {
       o.product_code,
       o.amount,
       o.currency,
+      o.payment_provider,
       o.payment_status,
       o.created_at,
       l.license_key
@@ -715,6 +845,11 @@ async function showOrders(chatId, user) {
     `Тариф: ${order.product_code}\n` +
     `Сумма: ${order.amount} ${order.currency}\n` +
     `Статус: ${order.payment_status}` +
+    (
+      order.payment_provider === "admin_test"
+        ? "\n🧪 Тестовая покупка"
+        : ""
+    ) +
     (
       order.license_key
         ? `\n🔑 Лицензия: ${order.license_key}`
@@ -749,7 +884,6 @@ async function showSupport(chatId) {
 // ==========================================
 
 async function handleTelegramUpdate(update) {
-  // Предварительная проверка платежа
   if (update.pre_checkout_query) {
     await handlePreCheckout(update.pre_checkout_query);
     return;
@@ -764,7 +898,6 @@ async function handleTelegramUpdate(update) {
 
     await saveTelegramCustomer(user);
 
-    // Успешная оплата
     if (message.successful_payment) {
       await handleSuccessfulPayment(message);
       return;
@@ -817,6 +950,19 @@ async function handleTelegramUpdate(update) {
     if (!user || !chatId) return;
 
     await saveTelegramCustomer(user);
+
+    // Тестовая покупка — только для администратора
+    if (query.data === "admin_test_month") {
+      if (
+        !ADMIN_TELEGRAM_ID ||
+        String(user.id) !== String(ADMIN_TELEGRAM_ID)
+      ) {
+        return;
+      }
+
+      await createAdminTestPurchase(user, chatId);
+      return;
+    }
 
     if (query.data === "shop_menu") {
       await sendShopMenu(chatId);
