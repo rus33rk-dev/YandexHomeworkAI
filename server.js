@@ -1,9 +1,11 @@
+
 require("dotenv").config();
 
 const express = require("express");
 const OpenAI = require("openai");
 const { Pool } = require("pg");
 const crypto = require("crypto");
+const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 3210;
@@ -135,8 +137,6 @@ async function initializeDatabase() {
     ALTER TABLE orders
       ADD COLUMN IF NOT EXISTS telegram_payment_charge_id TEXT;
 
-    -- Привязка лицензии к одному устройству.
-    -- У существующих лицензий поле будет пустым до первой активации.
     ALTER TABLE licenses
       ADD COLUMN IF NOT EXISTS device_id TEXT;
   `);
@@ -166,6 +166,12 @@ app.use((req, res, next) => {
 });
 
 // ==========================================
+// WEB APP — СТАТИЧЕСКИЕ ФАЙЛЫ
+// ==========================================
+
+app.use(express.static(path.join(__dirname, "public")));
+
+// ==========================================
 // ЛИЦЕНЗИИ И ЗАЩИТА API
 // ==========================================
 
@@ -186,15 +192,6 @@ function getDeviceId(req) {
   return String(req.headers["x-device-id"] || "").trim();
 }
 
-/**
- * Проверяет, что лицензия:
- * - существует;
- * - активна и не просрочена;
- * - принадлежит настоящему оплаченному заказу Telegram Stars;
- * - привязана к тому устройству, с которого пришёл запрос.
- *
- * admin_test намеренно не считается настоящей оплатой.
- */
 async function findValidLicense(licenseKey, deviceId) {
   if (!licenseKey || !deviceId) {
     return {
@@ -230,8 +227,6 @@ async function findValidLicense(licenseKey, deviceId) {
     };
   }
 
-  // Тестовые покупки и любые не подтверждённые платежи
-  // не открывают доступ к рабочему API.
   if (
     license.payment_provider !== "telegram_stars" ||
     license.payment_status !== "paid"
@@ -294,10 +289,6 @@ async function findValidLicense(licenseKey, deviceId) {
   };
 }
 
-/**
- * Middleware для всех платных функций приложения.
- * Ключ лицензии и ID устройства передаются в заголовках.
- */
 async function requireLicense(req, res, next) {
   try {
     const licenseKey = getBearerToken(req);
@@ -406,7 +397,6 @@ app.post("/license/activate", async (req, res) => {
       });
     }
 
-    // Запрещаем активировать тестовые ключи администратора.
     if (
       license.payment_provider !== "telegram_stars" ||
       license.payment_status !== "paid"
@@ -608,30 +598,10 @@ async function saveTelegramCustomer(user) {
 function shopMenu() {
   return {
     inline_keyboard: [
-      [
-        {
-          text: "🛍 Магазин",
-          callback_data: "shop_catalog"
-        }
-      ],
-      [
-        {
-          text: "👤 Мой профиль",
-          callback_data: "shop_profile"
-        }
-      ],
-      [
-        {
-          text: "📦 Мои покупки",
-          callback_data: "shop_orders"
-        }
-      ],
-      [
-        {
-          text: "💬 Поддержка",
-          callback_data: "shop_support"
-        }
-      ]
+      [{ text: "🛍 Магазин", callback_data: "shop_catalog" }],
+      [{ text: "👤 Мой профиль", callback_data: "shop_profile" }],
+      [{ text: "📦 Мои покупки", callback_data: "shop_orders" }],
+      [{ text: "💬 Поддержка", callback_data: "shop_support" }]
     ]
   };
 }
@@ -663,33 +633,12 @@ async function showCatalog(chatId) {
     "Сейчас доступна оплата Telegram Stars.";
 
   const keyboard = [
-    [
-      {
-        text: "1 месяц — 100 ⭐",
-        callback_data: "buy_month"
-      }
-    ],
-    [
-      {
-        text: "3 месяца — 270 ⭐",
-        callback_data: "buy_three_months"
-      }
-    ],
-    [
-      {
-        text: "6 месяцев — 470 ⭐",
-        callback_data: "buy_six_months"
-      }
-    ],
-    [
-      {
-        text: "12 месяцев — 740 ⭐",
-        callback_data: "buy_year"
-      }
-    ]
+    [{ text: "1 месяц — 100 ⭐", callback_data: "buy_month" }],
+    [{ text: "3 месяца — 270 ⭐", callback_data: "buy_three_months" }],
+    [{ text: "6 месяцев — 470 ⭐", callback_data: "buy_six_months" }],
+    [{ text: "12 месяцев — 740 ⭐", callback_data: "buy_year" }]
   ];
 
-  // Тестовая кнопка доступна только администратору.
   if (
     ADMIN_TELEGRAM_ID &&
     String(chatId) === String(ADMIN_TELEGRAM_ID)
@@ -866,7 +815,6 @@ async function handleSuccessfulPayment(message) {
   }
 
   const orderId = match[1];
-
   const db = await pool.connect();
 
   let license;
@@ -1319,7 +1267,6 @@ async function handleTelegramUpdate(update) {
 
     await saveTelegramCustomer(user);
 
-    // Тестовая покупка — только для администратора.
     if (query.data === "admin_test_month") {
       if (
         !ADMIN_TELEGRAM_ID ||
